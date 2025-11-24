@@ -1,0 +1,13 @@
+{
+  "name": "figma-to-html",
+  "version": "1.0.0",
+  "description": "Simple Figma to HTML/CSS generator",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "generate": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT"
+}
