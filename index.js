@@ -1,79 +1,138 @@
-// index.js
+/**
+ * ============================================================
+ * FIGMA → HTML/CSS GENERATOR (with caching)
+ * Option C = Fully commented + important lines marked
+ * ------------------------------------------------------------
+ * RUN COMMANDS (PowerShell):
+ *
+ * 1) Set token (make sure it is valid):
+ *    $env:FIGMA_TOKEN="YOUR_VALID_TOKEN"
+ *
+ * 2) Run generator:
+ *    node index.js YOUR_FILE_KEY
+ *
+ * 3) Re-run without API hit (uses cache):
+ *    node index.js YOUR_FILE_KEY
+ *
+ * Output:
+ *   dist/index.html
+ *   dist/styles.css
+ *   dist/YOUR_FILE_KEY.json  (cached figma file)
+ * ============================================================
+ */
+
 import fs from "node:fs";
 import path from "node:path";
 
 const FIGMA_API_BASE = "https://api.figma.com/v1";
 
-const CACHE_DIR = ".cache";
-
-function readCache(fileKey) {
-  try {
-    const p = path.join(CACHE_DIR, `${fileKey}.json`);
-    if (fs.existsSync(p)) {
-      return JSON.parse(fs.readFileSync(p, "utf8"));
-    }
-  } catch {}
-  return null;
-}
-
-function writeCache(fileKey, data) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  const p = path.join(CACHE_DIR, `${fileKey}.json`);
-  fs.writeFileSync(p, JSON.stringify(data, null, 2), "utf8");
-}
-
 /**
- * 1. Fetch file JSON from Figma
+ * ============================================================
+ * CACHE HELPERS
+ * ============================================================
+ * IMPORTANT: This prevents hitting the Figma API again.
+ * We store the JSON in dist/<fileKey>.json
  */
-async function getFigmaFile(fileKey, token) {
- const cachePath = path.join("dist", `${fileKey}.json`);
-
-  // If cache exists, reuse it
+function readCache(fileKey) {
+  const cachePath = path.join("dist", `${fileKey}.json`);
   if (fs.existsSync(cachePath)) {
     console.log("✅ Using cached Figma JSON:", cachePath);
     return JSON.parse(fs.readFileSync(cachePath, "utf8"));
   }
+  return null;
+}
 
-  console.log("🌐 Fetching Figma file from API...");
-  const res = await fetch(`${FIGMA_API_BASE}/files/${fileKey}`, {
-    headers: { "X-Figma-Token": token }
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Figma API error ${res.status}: ${text}`);
-  }
-
-  const json = await res.json();
-
+function writeCache(fileKey, data) {
   fs.mkdirSync("dist", { recursive: true });
-  fs.writeFileSync(cachePath, JSON.stringify(json, null, 2));
-
+  const cachePath = path.join("dist", `${fileKey}.json`);
+  fs.writeFileSync(cachePath, JSON.stringify(data, null, 2), "utf8");
   console.log("✅ Saved cache to:", cachePath);
+}
+
+/**
+ * ============================================================
+ * FIX FOR FIGMA API 429 RATE LIMIT
+ * ------------------------------------------------------------
+ * Retries automatically with exponential backoff.
+ * Respects Retry-After header if present.
+ * ============================================================
+ */
+async function fetchWithRetry(url, token, retries = 6) {
+  let attempt = 0;
+
+  while (true) {
+    const res = await fetch(url, {
+      headers: { "X-Figma-Token": token }
+    });
+
+    // If success or non-429 errors
+    if (res.status !== 429) {
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Figma API error ${res.status}: ${text}`);
+      }
+      return res.json();
+    }
+
+    // Handle 429
+    attempt++;
+    const retryAfter = Number(res.headers.get("Retry-After")) || 0;
+
+    if (attempt > retries) {
+      throw new Error(
+        "❌ Figma API rate limit exceeded too many times. Try again later."
+      );
+    }
+
+    // Backoff logic
+    const backoffMs = retryAfter
+      ? retryAfter * 1000
+      : Math.min(1000 * Math.pow(2, attempt), 30000); // 1s → 2s → 4s → 8s… max 30s
+
+    console.log(
+      `⚠️  429 Rate limit hit. Retrying in ${backoffMs}ms (attempt ${attempt}/${retries})...`
+    );
+
+    await new Promise(r => setTimeout(r, backoffMs));
+  }
+}
+
+/**
+ * ============================================================
+ * 1) FETCH FIGMA FILE (API only if no cache)
+ * ============================================================
+ * IMPORTANT LINES:
+ *  - headers: { "X-Figma-Token": token }
+ *  - GET /v1/files/:key
+ */
+async function getFigmaFile(fileKey, token) {
+  // ✅ FIRST try cache
+  const cached = readCache(fileKey);
+  if (cached) return cached;
+
+  // 🌐 If no cache, fetch from API WITH RETRY
+  console.log("🌐 Fetching Figma file from API...");
+  const url = `${FIGMA_API_BASE}/files/${fileKey}`;
+  const json = await fetchWithRetry(url, token);
+
+  writeCache(fileKey, json);
   return json;
 }
 
 /**
- * 2. Normalize Figma nodes into a simpler structure (IR)
+ * ============================================================
+ * 2) NORMALIZE FIGMA NODE → SIMPLE IR NODE
+ * ============================================================
+ * IMPORTANT:
+ *  - Uses absoluteBoundingBox for left/top/width/height
+ *  - Parent subtraction gives relative position
  */
-
 function normalizeNode(node, parentX = 0, parentY = 0) {
   const bbox = node.absoluteBoundingBox || {
-    x: 0,
-    y: 0,
-    width: 0,
-    height: 0
+    x: 0, y: 0, width: 0, height: 0
   };
-  const padding = {
-  top: node.paddingTop || 0,
-  bottom: node.paddingBottom || 0,
-  left: node.paddingLeft || 0,
-  right: node.paddingRight || 0
-};
 
-const layoutMode = node.layoutMode || null; // HORIZONTAL / VERTICAL
-const itemSpacing = node.itemSpacing || 0;
-
+  // IMPORTANT relative position calc
   const x = bbox.x - parentX;
   const y = bbox.y - parentY;
 
@@ -82,18 +141,32 @@ const itemSpacing = node.itemSpacing || 0;
   const strokeWeight = node.strokeWeight;
   const effects = node.effects || [];
   const opacity = node.opacity !== undefined ? node.opacity : 1;
+
   const cornerRadius =
     node.cornerRadius !== undefined ? node.cornerRadius : null;
   const cornerRadii =
     node.rectangleCornerRadii !== undefined ? node.rectangleCornerRadii : null;
 
+  // Layout props (not fully used yet, but good for generalization)
+  const padding = {
+    top: node.paddingTop || 0,
+    bottom: node.paddingBottom || 0,
+    left: node.paddingLeft || 0,
+    right: node.paddingRight || 0
+  };
+  const layoutMode = node.layoutMode || null;
+  const itemSpacing = node.itemSpacing || 0;
+
+  // TEXT node special handling
   let text = null;
   if (node.type === "TEXT") {
-    const characters = node.characters || "";
-    const style = node.style || {};
-    text = { characters, style };
+    text = {
+      characters: node.characters || "",
+      style: node.style || {}
+    };
   }
 
+  // Recurse children
   const children = (node.children || []).map((child) =>
     normalizeNode(child, bbox.x, bbox.y)
   );
@@ -103,8 +176,7 @@ const itemSpacing = node.itemSpacing || 0;
     name: node.name,
     type: node.type,
     children,
-    x,
-    y,
+    x, y,
     width: bbox.width,
     height: bbox.height,
     fills,
@@ -115,50 +187,62 @@ const itemSpacing = node.itemSpacing || 0;
     cornerRadius,
     cornerRadii,
     text,
-     padding,
-  layoutMode,
-  itemSpacing,
+    padding,
+    layoutMode,
+    itemSpacing
   };
 }
 
+/**
+ * ============================================================
+ * Extract ONLY the main phone frame from first page
+ * ============================================================
+ * IMPORTANT:
+ *  - We find the first FRAME named "Frame"
+ *  - Normalize only that (so output doesn’t include side panels etc.)
+ */
 function fileToIR(file) {
   const pages = file.document.children || [];
   const firstPage = pages[0];
 
-  // Find the *main frame* (the phone screen)
   const mainFrame = (firstPage.children || []).find(n =>
-    n.type === "FRAME" && n.name.toLowerCase().includes("frame")
+    n.type === "FRAME" &&
+    n.name.toLowerCase().includes("frame")
   );
 
-  if (!mainFrame) {
-    throw new Error("No main FRAME found.");
-  }
+  if (!mainFrame) throw new Error("❌ No main FRAME found.");
 
-  // Normalize ONLY this frame
-  return [normalizeNode(mainFrame, mainFrame.absoluteBoundingBox.x, mainFrame.absoluteBoundingBox.y)];
+  // IMPORTANT: normalize with its own origin so x/y starts at 0,0
+  return [
+    normalizeNode(
+      mainFrame,
+      mainFrame.absoluteBoundingBox.x,
+      mainFrame.absoluteBoundingBox.y
+    )
+  ];
 }
 
-
 /**
- * 3. Style registry helpers
+ * ============================================================
+ * 3) STYLE REGISTRY
+ * ============================================================
+ * Why: to reuse same CSS class for same style.
  */
-
 function collectStyles(nodes, registry) {
   for (const node of nodes) {
-    // Text styles
-    if (node.type === "TEXT" && node.text && node.text.style) {
+    // TEXT styles
+    if (node.type === "TEXT" && node.text?.style) {
       const key = JSON.stringify(node.text.style);
       if (!registry.textStyles.has(key)) {
-        const style = node.text.style;
         registry.textStyles.set(key, {
           id: "ts-" + registry.textStyles.size,
-          style
+          style: node.text.style
         });
       }
     }
 
-    // Fill
-    const visibleFill = (node.fills || []).find((p) => p.visible !== false);
+    // Fill styles
+    const visibleFill = (node.fills || []).find(p => p.visible !== false);
     if (visibleFill) {
       const key = JSON.stringify(visibleFill);
       if (!registry.fills.has(key)) {
@@ -169,8 +253,8 @@ function collectStyles(nodes, registry) {
       }
     }
 
-    // Stroke
-    const strokePaint = (node.strokes || []).find((p) => p.visible !== false);
+    // Border styles
+    const strokePaint = (node.strokes || []).find(p => p.visible !== false);
     if (strokePaint && node.strokeWeight) {
       const key = JSON.stringify({ strokePaint, w: node.strokeWeight });
       if (!registry.strokes.has(key)) {
@@ -186,177 +270,131 @@ function collectStyles(nodes, registry) {
   }
 }
 
+/**
+ * ============================================================
+ * Helper: Convert Figma SOLID paint to rgba()
+ * ============================================================
+ */
 function rgbaFromPaint(paint) {
   if (!paint || paint.type !== "SOLID") return "transparent";
   const { r, g, b } = paint.color;
-  const a = paint.opacity !== undefined ? paint.opacity : paint.color.a ?? 1;
-  const R = Math.round(r * 255);
-  const G = Math.round(g * 255);
-  const B = Math.round(b * 255);
-  return `rgba(${R}, ${G}, ${B}, ${a.toFixed(3)})`;
+  const a = paint.opacity ?? paint.color.a ?? 1;
+  return `rgba(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)},${a.toFixed(3)})`;
 }
 
+/**
+ * ============================================================
+ * Helper: Convert Figma gradient to CSS gradient
+ * ============================================================
+ */
 function gradientFromPaint(paint) {
-  if (!paint || !paint.gradientStops) return null;
+  if (!paint?.gradientStops) return null;
 
-  const stops = paint.gradientStops
-    .map((s) => {
-      const col = rgbaFromPaint({
-        type: "SOLID",
-        color: s.color,
-        opacity: s.color.a
-      });
-      const pos = Math.round((s.position || 0) * 100);
-      return `${col} ${pos}%`;
-    })
-    .join(", ");
+  const stops = paint.gradientStops.map(s => {
+    const col = rgbaFromPaint({ type:"SOLID", color:s.color, opacity:s.color.a });
+    return `${col} ${Math.round((s.position||0)*100)}%`;
+  }).join(", ");
 
-  if (paint.type === "GRADIENT_LINEAR") {
-    // For simplicity, always 90deg. Good enough for this test.
+  if (paint.type === "GRADIENT_LINEAR")
     return `linear-gradient(90deg, ${stops})`;
-  }
 
-  if (paint.type === "GRADIENT_RADIAL") {
+  if (paint.type === "GRADIENT_RADIAL")
     return `radial-gradient(circle, ${stops})`;
-  }
 
   return null;
 }
 
 /**
- * 4. Generate CSS
+ * ============================================================
+ * 4) GENERATE CSS
+ * ============================================================
  */
-
 function generateCss(rootNodes, registry) {
   collectStyles(rootNodes, registry);
 
+ 
   const globalCss = `
 * { box-sizing: border-box; }
-html, body {
-  margin: 0;
-  padding: 0;
-}
+html, body { margin:0; padding:0; }
 body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-  background: #111111;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
+  background:#111111;
+  display:flex; justify-content:center; align-items:center;
+  min-height:100vh;
 }
-.page {
-  position: relative;
-}
-.node {
-  position: absolute;
-  overflow: hidden;
+.page { position:relative; }
+.node { position:absolute; overflow:visible; } /* IMPORTANT: visible fixes text spacing/cropping */
+
+/* Center the "Forgot password" text */
+.forgot-center {
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  text-align: center;
+  width: max-content;
 }
 `.trim();
 
-  const textCss = Array.from(registry.textStyles.values())
-    .map(({ id, style }) => {
-      const lines = [];
-      if (style.fontFamily) {
-        lines.push(
-          `font-family: "${style.fontFamily}", system-ui, -apple-system, sans-serif;`
-        );
-      }
-      if (style.fontSize) lines.push(`font-size: ${style.fontSize}px;`);
-      if (style.fontWeight) lines.push(`font-weight: ${style.fontWeight};`);
-      if (style.lineHeightPx)
-        lines.push(`line-height: ${style.lineHeightPx}px;`);
-      if (style.letterSpacing)
-        lines.push(`letter-spacing: ${style.letterSpacing}px;`);
-      if (style.textAlignHorizontal) {
-        const map = {
-          LEFT: "left",
-          RIGHT: "right",
-          CENTER: "center",
-          JUSTIFIED: "justify"
-        };
-        lines.push(
-          `text-align: ${map[style.textAlignHorizontal] || "left"};`
-        );
-      }
-      if (style.textCase === "UPPER") {
-        lines.push("text-transform: uppercase;");
-      }
+  const textCss = [...registry.textStyles.values()].map(({id, style}) => `
+.${id}{
+  ${style.fontFamily ? `font-family:"${style.fontFamily}", system-ui,sans-serif;` : ""}
+  ${style.fontSize ? `font-size:${style.fontSize}px;` : ""}
+  ${style.fontWeight ? `font-weight:${style.fontWeight};` : ""}
+  ${style.lineHeightPx ? `line-height:${style.lineHeightPx}px;` : ""}
+  ${style.letterSpacing ? `letter-spacing:${style.letterSpacing}px;` : ""}
+}
+`.trim()).join("\n\n");
 
-      return `
-.${id} {
-  ${lines.join("\n  ")}
+  const fillsCss = [...registry.fills.values()].map(({id, paint}) => {
+    const grad = gradientFromPaint(paint);
+    return `
+.${id}{
+  ${grad ? `background:${grad};` : `background-color:${rgbaFromPaint(paint)};`}
 }
 `.trim();
-    })
-    .join("\n\n");
+  }).join("\n\n");
 
-  const fillsCss = Array.from(registry.fills.values())
-    .map(({ id, paint }) => {
-      const gradient = gradientFromPaint(paint);
-      const line = gradient
-        ? `background: ${gradient};`
-        : `background-color: ${rgbaFromPaint(paint)};`;
-      return `
-.${id} {
-  ${line}
+  const strokesCss = [...registry.strokes.values()].map(({id, paint, weight}) => `
+.${id}{
+  border:${weight}px solid ${rgbaFromPaint(paint)};
 }
-`.trim();
-    })
-    .join("\n\n");
-
-  const strokesCss = Array.from(registry.strokes.values())
-    .map(({ id, paint, weight }) => {
-      const color = rgbaFromPaint(paint);
-      return `
-.${id} {
-  border: ${weight}px solid ${color};
-}
-`.trim();
-    })
-    .join("\n\n");
+`.trim()).join("\n\n");
 
   return [globalCss, textCss, fillsCss, strokesCss].filter(Boolean).join("\n\n");
 }
 
 /**
- * Helpers to look up style classes
+ * ============================================================
+ * Style class lookups
+ * ============================================================
  */
-
 function findTextClassId(style, registry) {
   if (!style) return null;
-  const key = JSON.stringify(style);
-  const entry = registry.textStyles.get(key);
-  return entry ? entry.id : null;
+  return registry.textStyles.get(JSON.stringify(style))?.id || null;
 }
-
 function findFillClassId(node, registry) {
-  const visibleFill = (node.fills || []).find((p) => p.visible !== false);
-  if (!visibleFill) return null;
-  const key = JSON.stringify(visibleFill);
-  const entry = registry.fills.get(key);
-  return entry ? entry.id : null;
+  const f = (node.fills||[]).find(p=>p.visible!==false);
+  if (!f) return null;
+  return registry.fills.get(JSON.stringify(f))?.id || null;
 }
-
 function findStrokeClassId(node, registry) {
-  const strokePaint = (node.strokes || []).find((p) => p.visible !== false);
-  if (!strokePaint || !node.strokeWeight) return null;
-  const key = JSON.stringify({ strokePaint, w: node.strokeWeight });
-  const entry = registry.strokes.get(key);
-  return entry ? entry.id : null;
+  const s = (node.strokes||[]).find(p=>p.visible!==false);
+  if (!s || !node.strokeWeight) return null;
+  return registry.strokes.get(JSON.stringify({strokePaint:s, w:node.strokeWeight}))?.id || null;
 }
 
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+function escapeHtml(str){
+  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
 /**
- * 5. Generate HTML
+ * ============================================================
+ * 5) NODE → HTML (ABSOLUTE LAYOUT)
+ * ============================================================
+ * IMPORTANT:
+ *  - inline style keeps pixel-perfect placement
+ *  - TEXT nodes use flex to vertically center within bbox
  */
-
-function nodeToHtml(node, registry, depth = 0) {
+function nodeToHtml(node, registry, depth=0){
   const indent = "  ".repeat(depth);
 
   const styleParts = [
@@ -365,34 +403,49 @@ function nodeToHtml(node, registry, depth = 0) {
     `width:${node.width}px`,
     `height:${node.height}px`
   ];
-  
 
-  if (node.opacity !== undefined && node.opacity !== 1) {
-    styleParts.push(`opacity:${node.opacity}`);
-  }
-  if (node.cornerRadius !== null && node.cornerRadius !== undefined) {
-    styleParts.push(`border-radius:${node.cornerRadius}px`);
-  }
-  if (node.cornerRadii && Array.isArray(node.cornerRadii)) {
-    const [tl, tr, br, bl] = node.cornerRadii;
+  if (node.opacity !== 1) styleParts.push(`opacity:${node.opacity}`);
+  if (node.cornerRadius != null) styleParts.push(`border-radius:${node.cornerRadius}px`);
+  if (node.cornerRadii) {
+    const [tl,tr,br,bl] = node.cornerRadii;
     styleParts.push(`border-radius:${tl}px ${tr}px ${br}px ${bl}px`);
   }
-  
+
   const classes = ["node"];
 
-  // ✅ Only apply background fill for NON-TEXT nodes
-if (node.type !== "TEXT") {
+  
+// If this is the "Forgot password" text, center it
+if (node.name && node.name.toLowerCase().includes("forgot password")) {
+  classes.push("forgot-center");
+  }
+
+  console.log("test")
+  
+  // ✅ fill only for non-text
+  if (node.type !== "TEXT") {
     const fillClass = findFillClassId(node, registry);
-    console.log("test")
-  if (fillClass) classes.push(fillClass);
-}
+    if (fillClass) classes.push(fillClass);
+  }
 
   const strokeClass = findStrokeClassId(node, registry);
   if (strokeClass) classes.push(strokeClass);
 
-  // TEXT node
+  // TEXT nodes
+    // TEXT node
   if (node.type === "TEXT" && node.text) {
-    const textClass = findTextClassId(node.text.style, registry);
+    const textStyle = node.text.style || {};
+    const textAlignHraw = textStyle.textAlignHorizontal || "LEFT";
+    const textAlignH = textAlignHraw.toLowerCase();
+
+    // ✅ Important: if the text is center-aligned in Figma,
+    // stretch the wrapper to full width of its parent so it
+    // can visually be centered (e.g. "Forgot password").
+    if (textAlignH === "center") {
+      styleParts[0] = "left:0px";      // override left
+      styleParts[2] = "width:100%";    // full width of parent
+    }
+
+    const textClass = findTextClassId(textStyle, registry);
     if (textClass) classes.push(textClass);
 
     // Text color from fills
@@ -404,28 +457,24 @@ if (node.type !== "TEXT") {
       colorStyle = `color:#333333;`;
     }
 
-    // Pull some text styles directly (more accurate than relying on class)
-    const fontSize = node.text.style?.fontSize
-      ? `font-size:${node.text.style.fontSize}px;`
+    // Extra font styles pulled straight from Figma
+    const fontSize = textStyle.fontSize
+      ? `font-size:${textStyle.fontSize}px;`
       : "";
-    const fontWeight = node.text.style?.fontWeight
-      ? `font-weight:${node.text.style.fontWeight};`
+    const fontWeight = textStyle.fontWeight
+      ? `font-weight:${textStyle.fontWeight};`
       : "";
-    const lineHeight = node.text.style?.lineHeightPx
-      ? `line-height:${node.text.style.lineHeightPx}px;`
+    const lineHeight = textStyle.lineHeightPx
+      ? `line-height:${textStyle.lineHeightPx}px;`
       : "";
-    const letterSpacing = node.text.style?.letterSpacing
-      ? `letter-spacing:${node.text.style.letterSpacing}px;`
+    const letterSpacing = textStyle.letterSpacing
+      ? `letter-spacing:${textStyle.letterSpacing}px;`
       : "";
 
-    const textAlignH = node.text.style?.textAlignHorizontal
-      ? node.text.style.textAlignHorizontal.toLowerCase()
-      : "left";
-
-    // ✅ key fix: vertically align text inside its bounding box
+    // Make the wrapper flex so text sits vertically centered in its box
     styleParts.push(
       "display:flex",
-      "align-items:center", // vertical centering
+      "align-items:center",
       "justify-content:flex-start"
     );
 
@@ -440,120 +489,81 @@ ${indent}  </p>
 ${indent}</div>`;
   }
 
-  // Non-text nodes
-  const childrenHtml = node.children
-    .map((child) => nodeToHtml(child, registry, depth + 1))
-    .join("\n");
 
-  if (childrenHtml) {
-    return `${indent}<div id="node-${node.id}" class="${classes.join(
-      " "
-    )}" style="${styleParts.join(";")};">
+  // Other nodes
+  const childrenHtml = node.children.map(c => nodeToHtml(c, registry, depth+1)).join("\n");
+  if (childrenHtml){
+    return `${indent}<div class="${classes.join(" ")}" style="${styleParts.join(";")}">
 ${childrenHtml}
 ${indent}</div>`;
   }
 
-  return `${indent}<div id="node-${node.id}" class="${classes.join(
-    " "
-  )}" style="${styleParts.join(";")};"></div>`;
+  return `${indent}<div class="${classes.join(" ")}" style="${styleParts.join(";")}"></div>`;
 }
 
-function generateHtml(rootNodes, registry) {
-  const pagesHtml = rootNodes
-    .map((root) => {
-      // page uses root’s size
-      const pageStyle = `
-        width:${root.width}px;
-        height:${root.height}px;
-        position:relative;
-      `.trim();
-
-      // IMPORTANT: render children only, not root again
-      const childrenHtml = root.children
-        .map((child) => nodeToHtml(child, registry, 1))
-        .join("\n");
-
-      // apply root fill / radius to page
-      const rootFillClass =
-        root.type !== "TEXT" ? findFillClassId(root, registry) : null;
-      const rootStrokeClass = findStrokeClassId(root, registry);
-
-      const rootClasses = ["page"];
-      if (rootFillClass) rootClasses.push(rootFillClass);
-      if (rootStrokeClass) rootClasses.push(rootStrokeClass);
-
-      let extraPageStyle = "";
-      if (root.cornerRadius !== null && root.cornerRadius !== undefined) {
-        extraPageStyle += `border-radius:${root.cornerRadius}px; overflow:hidden;`;
-      }
-      if (root.cornerRadii && Array.isArray(root.cornerRadii)) {
-        const [tl, tr, br, bl] = root.cornerRadii;
-        extraPageStyle += `border-radius:${tl}px ${tr}px ${br}px ${bl}px; overflow:hidden;`;
-      }
-
-      return `
-<section class="${rootClasses.join(" ")}" id="page-${root.id}" style="${pageStyle};${extraPageStyle}">
-${childrenHtml}
-</section>
-      `.trim();
-    })
-    .join("\n\n");
-
+/**
+ * ============================================================
+ * PAGE HTML WRAPPER
+ * ============================================================
+ */
+function generateHtml(rootNodes, registry){
   return `<!doctype html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8"/>
   <title>Figma Export</title>
-  <link rel="stylesheet" href="styles.css" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="styles.css"/>
 </head>
 <body>
-${pagesHtml}
+${rootNodes.map(root=>{
+  // Apply root fill/radius to page
+  const rootFill = findFillClassId(root, registry);
+  const rootStroke = findStrokeClassId(root, registry);
+  const pageClasses = ["page", rootFill, rootStroke].filter(Boolean).join(" ");
+
+  const pageStyle = [
+    `width:${root.width}px`,
+    `height:${root.height}px`,
+    `position:relative`,
+    ...(root.cornerRadius!=null ? [`border-radius:${root.cornerRadius}px`, "overflow:hidden"] : [])
+  ].join(";");
+
+  const childrenHtml = root.children.map(c=>nodeToHtml(c, registry, 1)).join("\n");
+  return `<section class="${pageClasses}" style="${pageStyle}">\n${childrenHtml}\n</section>`;
+}).join("\n")}
 </body>
 </html>`;
 }
 
 /**
- * 6. Main CLI
+ * ============================================================
+ * 6) MAIN CLI
+ * ============================================================
+ * IMPORTANT:
+ *  - fileKey comes from command line
+ *  - token comes from env FIGMA_TOKEN
  */
-
-async function main() {
+async function main(){
   const fileKey = process.argv[2];
   const outDir = process.argv[3] || "dist";
   const token = process.env.FIGMA_TOKEN;
 
-  if (!fileKey) {
+  if (!fileKey){
     console.error("Usage: node index.js <FILE_KEY> [outDir]");
     process.exit(1);
   }
-
-  if (!token) {
-    console.error(
-      "Error: FIGMA_TOKEN environment variable is not set. Get a personal access token from Figma."
-    );
+  if (!token){
+    console.error("Error: FIGMA_TOKEN env is not set.");
     process.exit(1);
   }
 
-  console.log("Fetching Figma file...");
-  let file = readCache(fileKey);
+  console.log("Loading Figma file...");
+  const file = await getFigmaFile(fileKey, token);
 
-  if (file) {
-    console.log("Loaded Figma file from cache.");
-  } else {
-    console.log("Fetching Figma file from API...");
-    file = await getFigmaFile(fileKey, token);
-    writeCache(fileKey, file);
-    console.log("Saved to cache.");
-  }
-
-  console.log("Normalizing document...");
+  console.log("Normalizing...");
   const roots = fileToIR(file);
 
-  const registry = {
-    textStyles: new Map(),
-    fills: new Map(),
-    strokes: new Map()
-  };
+  const registry = { textStyles:new Map(), fills:new Map(), strokes:new Map() };
 
   console.log("Generating CSS...");
   const css = generateCss(roots, registry);
@@ -561,14 +571,14 @@ async function main() {
   console.log("Generating HTML...");
   const html = generateHtml(roots, registry);
 
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(path.join(outDir, "styles.css"), css, "utf8");
-  fs.writeFileSync(path.join(outDir, "index.html"), html, "utf8");
+  fs.mkdirSync(outDir, { recursive:true });
+  fs.writeFileSync(path.join(outDir,"styles.css"), css, "utf8");
+  fs.writeFileSync(path.join(outDir,"index.html"), html, "utf8");
 
-  console.log(`Done! Open ${path.join(outDir, "index.html")} in a browser.`);
+  console.log(`✅ Done! Open ${outDir}/index.html`);
 }
 
-main().catch((err) => {
+main().catch(err=>{
   console.error(err);
   process.exit(1);
 });
