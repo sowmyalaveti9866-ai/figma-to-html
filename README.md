@@ -18,5 +18,27 @@ run on other Figma mocks as well.
 ### 1) Set your Figma token
 PowerShell:
 
-```powershell
 $env:FIGMA_TOKEN="YOUR_FIGMA_PERSONAL_ACCESS_TOKEN"
+
+### 2. Run the generator
+node index.js YOUR_FIGMA_FILE_KEY
+
+Output will appear in the dist/ folder.
+
+### ⚠️ Known Limitations
+
+1. Rate-limited (429) responses if the Figma API is hit repeatedly — use the built-in cache before retrying.
+
+2. Some Figma features (Auto-layout, constraints, responsive rules, components, variants, rotations, blend modes) are not fully supported.
+
+3. Uses absolute positioning only — resulting HTML is not responsive.
+
+4. Gradient directions simplified (e.g., default 90° for linear gradients).
+
+5. Text vertical alignment may vary slightly between browsers and Figma.
+
+6. Designed for mock-fidelity, not production-ready UI.
+
+### Output
+
+<img width="1913" height="976" alt="image" src="https://github.com/user-attachments/assets/c9efed1b-8893-4011-be1e-633902bcb6e4" />
